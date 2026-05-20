@@ -1,0 +1,905 @@
+diff --git a/sql/catalyst/pom.xml b/sql/catalyst/pom.xml
+index 58a2333..7513ad9 100644
+--- a/sql/catalyst/pom.xml
++++ b/sql/catalyst/pom.xml
+@@ -116,6 +116,19 @@
+       <artifactId>datasketches-java</artifactId>
+       <version>3.3.0</version>
+     </dependency>
++    <!-- sttp client4 -->
++    <dependency>
++      <groupId>com.softwaremill.sttp.client4</groupId>
++      <artifactId>core_${scala.binary.version}</artifactId>
++      <version>4.0.0-RC1</version>
++    </dependency>
++
++    <!-- upickle -->
++    <dependency>
++      <groupId>com.lihaoyi</groupId>
++      <artifactId>upickle_${scala.binary.version}</artifactId>
++      <version>4.1.0</version>
++    </dependency>
+   </dependencies>
+   <build>
+     <outputDirectory>target/scala-${scala.binary.version}/classes</outputDirectory>
+diff --git a/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/optimizer/CostBasedJoinReorder.scala b/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/optimizer/CostBasedJoinReorder.scala
+index 471f0bd..0ef753d 100644
+--- a/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/optimizer/CostBasedJoinReorder.scala
++++ b/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/optimizer/CostBasedJoinReorder.scala
+@@ -26,7 +26,7 @@ import org.apache.spark.sql.catalyst.plans.logical._
+ import org.apache.spark.sql.catalyst.rules.Rule
+ import org.apache.spark.sql.catalyst.trees.TreePattern.INNER_LIKE_JOIN
+ import org.apache.spark.sql.internal.SQLConf
+-
++import org.apache.spark.sql.util.CalibraClient
+ 
+ /**
+  * Cost-based join reorder.
+@@ -123,9 +123,9 @@ case class OrderedJoin(
+  * at previous levels (two-way joins and single items), then 4-way joins ... etc, until we
+  * build all n-way joins and pick the best plan among them.
+  *
+- * When building m-way joins, we only keep the best plan (with the lowest cost) for the same set
+- * of m items. E.g., for 3-way joins, we keep only the best plan for items {A, B, C} among
+- * plans (A J B) J C, (A J C) J B and (B J C) J A.
++ * When building m-way joins, we keep a configurable beam of low-cost plans for the same set
++ * of m items. E.g., for 3-way joins, this can keep multiple alternatives for items {A, B, C}
++ * among plans (A J B) J C, (A J C) J B and (B J C) J A.
+  * We also prune cartesian product candidates when building a new plan if there exists no join
+  * condition involving references from both left and right. This pruning strategy significantly
+  * reduces the search space.
+@@ -149,6 +149,8 @@ object JoinReorderDP extends PredicateHelper with Logging {
+       output: Seq[Attribute]): LogicalPlan = {
+ 
+     val startTime = System.nanoTime()
++    val beamWidth = math.max(1,
++      conf.getConfString("spark.sql.cbo.joinReorder.dp.beamWidth", "1").toInt)
+     // Level i maintains all found plans for i + 1 items.
+     // Create the initial plans: each plan is a single item with zero cost.
+     val itemIndex = items.zipWithIndex
+@@ -158,7 +160,7 @@ object JoinReorderDP extends PredicateHelper with Logging {
+       val joinPlanMap = new JoinPlanMap
+       itemIndex.foreach {
+         case (item, id) =>
+-          joinPlanMap.put(Set(id), JoinPlan(Set(id), item, ExpressionSet(), Cost(0, 0)))
++          joinPlanMap.put(Set(id), Seq(JoinPlan(Set(id), item, ExpressionSet(), Cost(0, 0))))
+       }
+       joinPlanMap
+     })
+@@ -166,21 +168,22 @@ object JoinReorderDP extends PredicateHelper with Logging {
+     // Build filters from the join graph to be used by the search algorithm.
+     val filters = JoinReorderDPFilters.buildJoinGraphInfo(conf, items, conditions, itemIndex)
+ 
+-    // Build plans for next levels until the last level has only one plan. This plan contains
+-    // all items that can be joined, so there's no need to continue.
++    // Build plans for next levels until the last level has all items.
+     val topOutputSet = AttributeSet(output)
+     while (foundPlans.size < items.length) {
+-      // Build plans for the next level.
+-      foundPlans += searchLevel(foundPlans.toSeq, conf, conditions, topOutputSet, filters)
++      foundPlans += searchLevel(foundPlans.toSeq, conf, conditions, topOutputSet, filters,
++        beamWidth)
+     }
+ 
+     val durationInMs = (System.nanoTime() - startTime) / (1000 * 1000)
+     logDebug(s"Join reordering finished. Duration: $durationInMs ms, number of items: " +
+-      s"${items.length}, number of plans in memo: ${foundPlans.map(_.size).sum}")
++      s"${items.length}, number of plans in memo: " +
++      s"${foundPlans.map(_.values.map(_.size).sum).sum}")
+ 
+-    // The last level must have one and only one plan, because all items are joinable.
++    // The last level must have one and only one item set, because all items are joinable.
+     assert(foundPlans.size == items.length && foundPlans.last.size == 1)
+-    foundPlans.last.head._2.plan match {
++    val finalJoinPlan = rankJoinPlans(foundPlans.last.head._2, conf, 1).head
++    finalJoinPlan.plan match {
+       case p @ Project(projectList, j: Join) if projectList != output =>
+         assert(topOutputSet == p.outputSet)
+         // Keep the same order of final output attributes.
+@@ -199,13 +202,63 @@ object JoinReorderDP extends PredicateHelper with Logging {
+     }
+   }
+ 
++  private def shouldUseCalibraCost(plans: Seq[JoinPlan], conf: SQLConf): Boolean = {
++    if (plans.isEmpty) {
++      return false
++    }
++    val joinCount = plans.head.plan.collect { case j: Join => j }.size
++    shouldUseCalibraCostForJoinCount(conf, joinCount)
++  }
++
++  private def shouldUseCalibraCostForJoinCount(conf: SQLConf, joinCount: Int): Boolean = {
++    val globalCalibraEnabled = conf.getConfString("spark.sql.calibra.enabled", "false").toBoolean
++    val cboCalibraEnabled = conf.getConfString("spark.sql.cbo.calibra.enabled",
++      globalCalibraEnabled.toString).toBoolean
++    val calibraThreshold = conf.getConfString("spark.sql.cbo.joinReorder.dp.costEvaluateThreshold",
++      "4").toInt
++    globalCalibraEnabled && cboCalibraEnabled &&
++      (calibraThreshold <= 0 || joinCount < calibraThreshold)
++  }
++
++  private def rankJoinPlans(
++      plans: Seq[JoinPlan],
++      conf: SQLConf,
++      limit: Int): Seq[JoinPlan] = {
++    val topK = math.max(1, limit)
++    if (plans.length <= topK) {
++      return plans
++    }
++    if (shouldUseCalibraCost(plans, conf)) {
++      val costs = CalibraClient.chooseBestPlan(
++        0,
++        plans.toList,
++        decisionKind = "listwise",
++        selectK = topK)
++      plans.zip(costs).sortBy(_._2).take(topK).map(_._1)
++    } else {
++      plans.sortWith { case (left, right) =>
++        left.originalBetterThan(right, conf)
++      }.take(topK)
++    }
++  }
++
++  private def pruneBeamPlans(
++      nextLevel: JoinPlanMap,
++      conf: SQLConf,
++      beamWidth: Int): Unit = {
++    nextLevel.keys.toSeq.foreach { key =>
++      nextLevel.update(key, rankJoinPlans(nextLevel(key), conf, beamWidth))
++    }
++  }
++
+   /** Find all possible plans at the next level, based on existing levels. */
+   private def searchLevel(
+       existingLevels: Seq[JoinPlanMap],
+       conf: SQLConf,
+       conditions: ExpressionSet,
+       topOutput: AttributeSet,
+-      filters: Option[JoinGraphInfo]): JoinPlanMap = {
++      filters: Option[JoinGraphInfo],
++      beamWidth: Int): JoinPlanMap = {
+ 
+     val nextLevel = new JoinPlanMap
+     var k = 0
+@@ -215,34 +268,95 @@ object JoinReorderDP extends PredicateHelper with Logging {
+     // For the lower level k, we only need to search from 0 to lev - k, because when building
+     // a join from A and B, both A J B and B J A are handled.
+     while (k <= lev - k) {
+-      val oneSideCandidates = existingLevels(k).values.toSeq
++      val oneSideCandidates = existingLevels(k).values.toSeq.flatten
+       for (i <- oneSideCandidates.indices) {
+         val oneSidePlan = oneSideCandidates(i)
+         val otherSideCandidates = if (k == lev - k) {
+           // Both sides of a join are at the same level, no need to repeat for previous ones.
+           oneSideCandidates.drop(i)
+         } else {
+-          existingLevels(lev - k).values.toSeq
++          existingLevels(lev - k).values.toSeq.flatten
+         }
+ 
+         otherSideCandidates.foreach { otherSidePlan =>
+           buildJoin(oneSidePlan, otherSidePlan, conf, conditions, topOutput, filters) match {
+             case Some(newJoinPlan) =>
+-              // Check if it's the first plan for the item set, or it's a better plan than
+-              // the existing one due to lower cost.
+-              val existingPlan = nextLevel.get(newJoinPlan.itemIds)
+-              if (existingPlan.isEmpty || newJoinPlan.betterThan(existingPlan.get, conf)) {
+-                nextLevel.update(newJoinPlan.itemIds, newJoinPlan)
+-              }
++              val existingPlans = nextLevel.getOrElse(newJoinPlan.itemIds, Seq.empty)
++              nextLevel.update(newJoinPlan.itemIds, existingPlans :+ newJoinPlan)
+             case None =>
+           }
+         }
+       }
+       k += 1
+     }
++    pruneBeamPlans(nextLevel, conf, beamWidth)
++    val calibraEnabled = conf.getConfString("spark.sql.calibra.enabled", "false").toBoolean
++    val pruneMode = conf.getConfString("spark.sql.cbo.joinReorder.dp.pruneMode", "none")
++    val forceSendPlan = conf.joinReorderDPForceSendPlan
++    if (calibraEnabled && pruneMode != "none") {
++      val pruneLimit = conf.getConfString("spark.sql.cbo.joinReorder.dp.pruneLimit", "4").toInt
++      prunePlans(nextLevel, pruneMode, pruneLimit, forceSendPlan)
++    }
+     nextLevel
+   }
+ 
++  private def prunePlans(
++      nextLevel: JoinPlanMap,
++      mode: String,
++      k: Int,
++      forceSendPlan: Boolean): JoinPlanMap = {
++    val all = nextLevel.toList.flatMap {
++      case (key, plans) => plans.map(key -> _)
++    }
++    if (mode == "random") {
++      if (all.length <= k) {
++        return nextLevel
++      }
++      val rand = new scala.util.Random()
++      val toDrop = all.length - k
++      val keptPlans = rand.shuffle(all).drop(toDrop)
++      replacePlanPairs(nextLevel, keptPlans)
++      logWarning(s"[DP-Prune] pruned $toDrop / ${all.size} plans in this level")
++      nextLevel
++    } else if (mode == "top") {
++      if (all.length <= k && !forceSendPlan) {
++        return nextLevel
++      }
++      val joinPlans = all.map(_._2)
++      val costs: List[Double] = CalibraClient.chooseBestPlan(
++        0,
++        joinPlans,
++        decisionKind = "listwise",
++        selectK = k)
++      if (all.length <= k) {
++        nextLevel
++      } else {
++        val topPlans = all.zip(costs).sortBy(_._2).take(k).map(_._1)
++        replacePlanPairs(nextLevel, topPlans)
++        logWarning(s"[DP-Prune] pruned ${all.size - topPlans.size} / " +
++          s"${all.size} plans in this level (top k)")
++        nextLevel
++      }
++    } else {
++      nextLevel
++    }
++  }
++
++  private def replacePlanPairs(
++      nextLevel: JoinPlanMap,
++      planPairs: Seq[(Set[Int], JoinPlan)]): Unit = {
++    val grouped = mutable.LinkedHashMap.empty[Set[Int], mutable.ArrayBuffer[JoinPlan]]
++    planPairs.foreach {
++      case (key, plan) =>
++        grouped.getOrElseUpdate(key, mutable.ArrayBuffer.empty) += plan
++    }
++    nextLevel.clear()
++    grouped.foreach {
++      case (key, plans) =>
++        nextLevel.put(key, plans.toSeq)
++    }
++  }
++
+   /**
+    * Builds a new JoinPlan if the following conditions hold:
+    * - the sets of items contained in left and right sides do not overlap.
+@@ -324,14 +438,14 @@ object JoinReorderDP extends PredicateHelper with Logging {
+     Some(JoinPlan(itemIds, newPlan, collectedJoinConds, newPlanCost))
+   }
+ 
+-  /** Map[set of item ids, join plan for these items] */
+-  type JoinPlanMap = mutable.LinkedHashMap[Set[Int], JoinPlan]
++  /** Map[set of item ids, beam of join plans for these items] */
++  type JoinPlanMap = mutable.LinkedHashMap[Set[Int], Seq[JoinPlan]]
+ 
+   /**
+    * Partial join order in a specific level.
+    *
+    * @param itemIds Set of item ids participating in this partial plan.
+-   * @param plan The plan tree with the lowest cost for these items found so far.
++   * @param plan A retained plan tree for these items.
+    * @param joinConds Join conditions included in the plan.
+    * @param planCost The cost of this plan tree is the sum of costs of all intermediate joins.
+    */
+@@ -367,7 +481,7 @@ object JoinReorderDP extends PredicateHelper with Logging {
+      * two numeric measurements that have different units we can easily end up with one
+      * overwhelming the other.
+      */
+-    def betterThan(other: JoinPlan, conf: SQLConf): Boolean = {
++    def originalBetterThan(other: JoinPlan, conf: SQLConf): Boolean = {
+       if (other.planCost.card == 0 || other.planCost.size == 0) {
+         false
+       } else {
+@@ -377,6 +491,16 @@ object JoinReorderDP extends PredicateHelper with Logging {
+           Math.pow(relativeSize.doubleValue, 1 - conf.joinReorderCardWeight) < 1
+       }
+     }
++
++    def betterThan(other: JoinPlan, conf: SQLConf): Boolean = {
++      val original = originalBetterThan(other, conf)
++      val joinCount = this.plan.collect { case j: Join => j }.size
++      if (shouldUseCalibraCostForJoinCount(conf, joinCount)) {
++        CalibraClient.betterThan(this, other, original)
++      } else {
++        original
++      }
++    }
+   }
+ }
+ 
+diff --git a/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/optimizer/InjectRuntimeFilter.scala b/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/optimizer/InjectRuntimeFilter.scala
+index 44c5586..1932602 100644
+--- a/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/optimizer/InjectRuntimeFilter.scala
++++ b/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/optimizer/InjectRuntimeFilter.scala
+@@ -18,6 +18,7 @@
+ package org.apache.spark.sql.catalyst.optimizer
+ 
+ import scala.annotation.tailrec
++import scala.collection.mutable
+ 
+ import org.apache.spark.sql.catalyst.expressions._
+ import org.apache.spark.sql.catalyst.expressions.aggregate.BloomFilterAggregate
+@@ -224,6 +225,32 @@ object InjectRuntimeFilter extends Rule[LogicalPlan] with PredicateHelper with J
+       conf.getConf(SQLConf.RUNTIME_BLOOM_FILTER_APPLICATION_SIDE_SCAN_SIZE_THRESHOLD)
+   }
+ 
++  private def hasDuplicateLargeScan(plan: LogicalPlan): Boolean = {
++    if (!conf.getConf(SQLConf.RUNTIME_BLOOM_FILTER_SKIP_DUPLICATE_LARGE_SCAN_ENABLED)) {
++      return false
++    }
++
++    val threshold =
++      conf.getConf(SQLConf.RUNTIME_BLOOM_FILTER_DUPLICATE_LARGE_SCAN_THRESHOLD)
++    val defaultSizeInBytes = conf.getConf(SQLConf.DEFAULT_SIZE_IN_BYTES)
++    val seen = mutable.HashSet.empty[String]
++
++    plan.collect { case leaf: LeafNode => leaf }.exists { leaf =>
++      val scanSize = leaf.stats.sizeInBytes
++      if (scanSize == defaultSizeInBytes || scanSize < threshold) {
++        false
++      } else {
++        val key = leaf.canonicalized.toString()
++        if (seen.contains(key)) {
++          true
++        } else {
++          seen += key
++          false
++        }
++      }
++    }
++  }
++
+   /**
+    * Extracts the beneficial filter creation plan with check show below:
+    * - The filterApplicationSideJoinExp can be pushed down through joins, aggregates and windows
+@@ -315,35 +342,37 @@ object InjectRuntimeFilter extends Rule[LogicalPlan] with PredicateHelper with J
+       case join @ ExtractEquiJoinKeys(joinType, leftKeys, rightKeys, _, _, left, right, hint) =>
+         var newLeft = left
+         var newRight = right
+-        (leftKeys, rightKeys).zipped.foreach((l, r) => {
+-          // Check if:
+-          // 1. There is already a DPP filter on the key
+-          // 2. There is already a runtime filter (Bloom filter or IN subquery) on the key
+-          // 3. The keys are simple cheap expressions
+-          if (filterCounter < numFilterThreshold &&
+-            !hasDynamicPruningSubquery(left, right, l, r) &&
+-            !hasRuntimeFilter(newLeft, newRight, l, r) &&
+-            isSimpleExpression(l) && isSimpleExpression(r)) {
+-            val oldLeft = newLeft
+-            val oldRight = newRight
+-            if (canPruneLeft(joinType)) {
+-              extractBeneficialFilterCreatePlan(left, right, l, r, hint).foreach {
+-                filterCreationSidePlan =>
+-                  newLeft = injectFilter(l, newLeft, r, filterCreationSidePlan)
++        if (!hasDuplicateLargeScan(join)) {
++          (leftKeys, rightKeys).zipped.foreach((l, r) => {
++            // Check if:
++            // 1. There is already a DPP filter on the key
++            // 2. There is already a runtime filter (Bloom filter or IN subquery) on the key
++            // 3. The keys are simple cheap expressions
++            if (filterCounter < numFilterThreshold &&
++              !hasDynamicPruningSubquery(left, right, l, r) &&
++              !hasRuntimeFilter(newLeft, newRight, l, r) &&
++              isSimpleExpression(l) && isSimpleExpression(r)) {
++              val oldLeft = newLeft
++              val oldRight = newRight
++              if (canPruneLeft(joinType)) {
++                extractBeneficialFilterCreatePlan(left, right, l, r, hint).foreach {
++                  filterCreationSidePlan =>
++                    newLeft = injectFilter(l, newLeft, r, filterCreationSidePlan)
++                }
+               }
+-            }
+-            // Did we actually inject on the left? If not, try on the right
+-            if (newLeft.fastEquals(oldLeft) && canPruneRight(joinType)) {
+-              extractBeneficialFilterCreatePlan(right, left, r, l, hint).foreach {
+-                filterCreationSidePlan =>
+-                  newRight = injectFilter(r, newRight, l, filterCreationSidePlan)
++              // Did we actually inject on the left? If not, try on the right
++              if (newLeft.fastEquals(oldLeft) && canPruneRight(joinType)) {
++                extractBeneficialFilterCreatePlan(right, left, r, l, hint).foreach {
++                  filterCreationSidePlan =>
++                    newRight = injectFilter(r, newRight, l, filterCreationSidePlan)
++                }
++              }
++              if (!newLeft.fastEquals(oldLeft) || !newRight.fastEquals(oldRight)) {
++                filterCounter = filterCounter + 1
+               }
+             }
+-            if (!newLeft.fastEquals(oldLeft) || !newRight.fastEquals(oldRight)) {
+-              filterCounter = filterCounter + 1
+-            }
+-          }
+-        })
++          })
++        }
+         join.withNewChildren(Seq(newLeft, newRight))
+     }
+   }
+diff --git a/sql/catalyst/src/main/scala/org/apache/spark/sql/internal/SQLConf.scala b/sql/catalyst/src/main/scala/org/apache/spark/sql/internal/SQLConf.scala
+index 6f2f008..f5a652d 100644
+--- a/sql/catalyst/src/main/scala/org/apache/spark/sql/internal/SQLConf.scala
++++ b/sql/catalyst/src/main/scala/org/apache/spark/sql/internal/SQLConf.scala
+@@ -440,6 +440,23 @@ object SQLConf {
+       .longConf
+       .createWithDefault(67108864L)
+ 
++  val RUNTIME_BLOOM_FILTER_SKIP_DUPLICATE_LARGE_SCAN_ENABLED =
++    buildConf("spark.sql.optimizer.runtime.bloomFilter.skipDuplicateLargeScan.enabled")
++      .doc("When true, skip runtime bloom filter injection for a join subtree that contains " +
++        "multiple scans of the same large relation. This avoids regressions on large self-join " +
++        "shapes while preserving bloom filters for ordinary star-style joins.")
++      .version("3.5.4")
++      .booleanConf
++      .createWithDefault(false)
++
++  val RUNTIME_BLOOM_FILTER_DUPLICATE_LARGE_SCAN_THRESHOLD =
++    buildConf("spark.sql.optimizer.runtime.bloomFilter.duplicateLargeScanThreshold")
++      .doc("Minimum scan size for duplicate relation scans to be treated as large by " +
++        "spark.sql.optimizer.runtime.bloomFilter.skipDuplicateLargeScan.enabled.")
++      .version("3.5.4")
++      .bytesConf(ByteUnit.BYTE)
++      .createWithDefaultString("1GB")
++
+   val RUNTIME_ROW_LEVEL_OPERATION_GROUP_FILTER_ENABLED =
+     buildConf("spark.sql.optimizer.runtime.rowLevelOperationGroupFilter.enabled")
+       .doc("Enables runtime group filtering for group-based row-level operations. " +
+@@ -2671,6 +2688,15 @@ object SQLConf {
+       .booleanConf
+       .createWithDefault(false)
+ 
++  val JOIN_REORDER_DP_FORCE_SEND_PLAN =
++    buildConf("spark.sql.cbo.joinReorder.dp.forceSendPlan")
++      .doc("When true, DP top pruning still sends candidate plans to Calibra even when the " +
++        "candidate count is less than or equal to the prune limit, and returns all original " +
++        "candidates unchanged.")
++      .version("3.5.4")
++      .booleanConf
++      .createWithDefault(false)
++
+   val STARSCHEMA_DETECTION = buildConf("spark.sql.cbo.starSchemaDetection")
+     .doc("When true, it enables join reordering based on star schema detection. ")
+     .version("2.2.0")
+@@ -4999,6 +5025,9 @@ class SQLConf extends Serializable with Logging with SqlApiConf {
+ 
+   def joinReorderDPStarFilter: Boolean = getConf(SQLConf.JOIN_REORDER_DP_STAR_FILTER)
+ 
++  def joinReorderDPForceSendPlan: Boolean =
++    getConf(SQLConf.JOIN_REORDER_DP_FORCE_SEND_PLAN)
++
+   def windowExecBufferInMemoryThreshold: Int = getConf(WINDOW_EXEC_BUFFER_IN_MEMORY_THRESHOLD)
+ 
+   def windowExecBufferSpillThreshold: Int = getConf(WINDOW_EXEC_BUFFER_SPILL_THRESHOLD)
+diff --git a/sql/catalyst/src/main/scala/org/apache/spark/sql/util/CalibraClient.scala b/sql/catalyst/src/main/scala/org/apache/spark/sql/util/CalibraClient.scala
+new file mode 100644
+index 0000000..fc55a49
+--- /dev/null
++++ b/sql/catalyst/src/main/scala/org/apache/spark/sql/util/CalibraClient.scala
+@@ -0,0 +1,149 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.spark.sql.util
++
++import org.apache.logging.log4j.{Logger, LogManager}
++import sttp.client4.quick._
++import sttp.model.HttpVersion.HTTP_1_1
++import sttp.model.StatusCode._
++import upickle.default._
++
++import org.apache.spark.sql.catalyst.optimizer.JoinReorderDP.JoinPlan
++import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
++import org.apache.spark.sql.internal.SQLConf
++
++case class QueryStageInfo(
++    materialized: Boolean,
++    card: Long,
++    size: Long,
++    stagePlan: String)
++object QueryStageInfo { implicit val rw: ReadWriter[QueryStageInfo] = macroRW }
++
++case class PlanInfo(
++    plan: String,
++    queryStages: Map[String, QueryStageInfo],
++    card: Long,
++    size: Long)
++object PlanInfo { implicit val rw: ReadWriter[PlanInfo] = macroRW }
++
++case class CostRequest(
++    `type`: Int,
++    candidates: List[PlanInfo],
++    advisoryChoose: Int,
++    decisionKind: Option[String] = None,
++    selectK: Option[Int] = None)
++object CostRequest { implicit val rw: ReadWriter[CostRequest] = macroRW }
++
++case class CostResponse(costs: List[Double])
++object CostResponse { implicit val rw: ReadWriter[CostResponse] = macroRW }
++
++object CalibraClient {
++  val logger: Logger = LogManager.getLogger(this.getClass)
++  val conf: SQLConf = SQLConf.get
++  val serverUri: String = conf.getConfString("spark.sql.calibra.serverUri",
++    "http://localhost:10533")
++
++  private def logicalPlanText(plan: Any): String = plan match {
++    case joinPlan: JoinPlan => joinPlan.plan.toString
++    case logicalPlan: LogicalPlan => logicalPlan.toString
++    case other => other.toString
++  }
++
++  def sendCostRequest(req: CostRequest): Option[List[Double]] = {
++    val bodyStr = write(req)
++    try {
++      val response = quickRequest
++        .post(uri"$serverUri/cost")
++        .header("Content-Type", "application/json")
++        .body(bodyStr)
++        .httpVersion(HTTP_1_1)
++        .send()
++
++      if (response.code == Ok) {
++        val parsed = read[CostResponse](response.body)
++        Some(parsed.costs)
++      } else None
++
++    } catch {
++      case e: Exception =>
++        e.printStackTrace()
++        None
++    }
++  }
++
++  def betterThan(thisPlan: JoinPlan, otherPlan: JoinPlan, advisoryChoose: Boolean): Boolean = {
++    val req = CostRequest(
++      `type` = 0,
++      candidates = List(
++        PlanInfo(
++          plan = logicalPlanText(thisPlan),
++          queryStages = Map.empty,
++          card = thisPlan.planCost.card.toLong,
++          size = thisPlan.planCost.size.toLong
++        ),
++        PlanInfo(
++          plan = logicalPlanText(otherPlan),
++          queryStages = Map.empty,
++          card = otherPlan.planCost.card.toLong,
++          size = otherPlan.planCost.size.toLong
++        )
++      ),
++      advisoryChoose = if (advisoryChoose) 0 else 1,
++      decisionKind = Some("pairwise"),
++      selectK = Some(1)
++    )
++
++    val costsOpt = sendCostRequest(req)
++    val costs = costsOpt.get
++    costs(0) < costs(1)
++  }
++
++  def chooseBestPlan(
++      planType: Int,
++      plans: List[Any],
++      advisoryChoose: Int = 0,
++      decisionKind: String = "listwise",
++      selectK: Int = 1): List[Double] = {
++    val planInfos: List[PlanInfo] =
++      plans.map {
++        case jp: JoinPlan => PlanInfo(
++          plan = logicalPlanText(jp),
++          queryStages = Map.empty,
++          card = jp.planCost.card.toLong,
++          size = jp.planCost.size.toLong
++        )
++        case other => PlanInfo(
++          plan = logicalPlanText(other),
++          queryStages = Map.empty,
++          card = -1L,
++          size = -1L
++        )
++      }
++    val req = CostRequest(
++      `type` = planType,
++      candidates = planInfos,
++      advisoryChoose = advisoryChoose,
++      decisionKind = Some(decisionKind),
++      selectK = Some(selectK)
++    )
++    val costsOpt = sendCostRequest(req)
++    val costs = costsOpt.getOrElse(List.fill(plans.length)(1.0)
++      .updated(advisoryChoose, 0.0))
++    costs
++  }
++}
+diff --git a/sql/core/pom.xml b/sql/core/pom.xml
+index 9577de8..a11d653 100644
+--- a/sql/core/pom.xml
++++ b/sql/core/pom.xml
+@@ -217,6 +217,19 @@
+       <artifactId>htmlunit-driver</artifactId>
+       <scope>test</scope>
+     </dependency>
++    <!-- sttp client4 -->
++    <dependency>
++      <groupId>com.softwaremill.sttp.client4</groupId>
++      <artifactId>core_${scala.binary.version}</artifactId>
++      <version>4.0.0-RC1</version>
++    </dependency>
++
++    <!-- upickle -->
++    <dependency>
++      <groupId>com.lihaoyi</groupId>
++      <artifactId>upickle_${scala.binary.version}</artifactId>
++      <version>4.1.0</version>
++    </dependency>
+   </dependencies>
+   <build>
+     <outputDirectory>target/scala-${scala.binary.version}/classes</outputDirectory>
+diff --git a/sql/core/src/main/scala/org/apache/spark/sql/execution/QueryExecution.scala b/sql/core/src/main/scala/org/apache/spark/sql/execution/QueryExecution.scala
+index fd9d141..9c32b92 100644
+--- a/sql/core/src/main/scala/org/apache/spark/sql/execution/QueryExecution.scala
++++ b/sql/core/src/main/scala/org/apache/spark/sql/execution/QueryExecution.scala
+@@ -43,6 +43,7 @@ import org.apache.spark.sql.execution.reuse.ReuseExchangeAndSubquery
+ import org.apache.spark.sql.execution.streaming.{IncrementalExecution, OffsetSeqMetadata, WatermarkPropagator}
+ import org.apache.spark.sql.internal.SQLConf
+ import org.apache.spark.sql.streaming.OutputMode
++import org.apache.spark.sql.util.CalibraClient
+ import org.apache.spark.util.Utils
+ 
+ /**
+@@ -493,7 +494,24 @@ object QueryExecution {
+       plan: LogicalPlan): SparkPlan = {
+     // TODO: We use next(), i.e. take the first plan returned by the planner, here for now,
+     //       but we will implement to choose the best plan.
+-    planner.plan(ReturnAnswer(plan)).next()
++    val greedyEnabled = SQLConf.get.getConfString("spark.sql.planner.greedyEnabled",
++      "false").toBoolean
++    val calibraEnabled = SQLConf.get.getConfString("spark.sql.calibra.enabled",
++      "false").toBoolean
++    if (!greedyEnabled || !calibraEnabled) {
++      return planner.plan(ReturnAnswer(plan)).next()
++    }
++    val candidates = planner.plan(ReturnAnswer(plan)).toSeq
++
++    candidates.foreach(_.setLogicalLink(plan))
++    val costs = CalibraClient.chooseBestPlan(
++      1,
++      candidates.toList,
++      decisionKind = "listwise",
++      selectK = 1)
++    val minIndex = costs.indices.minBy(costs)
++
++    candidates(minIndex)
+   }
+ 
+   /**
+diff --git a/sql/core/src/main/scala/org/apache/spark/sql/execution/SparkPlanner.scala b/sql/core/src/main/scala/org/apache/spark/sql/execution/SparkPlanner.scala
+index 6f7dd85..ea3aba1 100644
+--- a/sql/core/src/main/scala/org/apache/spark/sql/execution/SparkPlanner.scala
++++ b/sql/core/src/main/scala/org/apache/spark/sql/execution/SparkPlanner.scala
+@@ -17,19 +17,23 @@
+ 
+ package org.apache.spark.sql.execution
+ 
++import org.apache.spark.internal.Logging
+ import org.apache.spark.sql._
+ import org.apache.spark.sql.catalyst.SQLConfHelper
+ import org.apache.spark.sql.catalyst.expressions._
+ import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
+-import org.apache.spark.sql.execution.adaptive.LogicalQueryStageStrategy
++import org.apache.spark.sql.execution.adaptive.{AQEShuffleReadExec, LogicalQueryStageStrategy, QueryStageExec}
+ import org.apache.spark.sql.execution.datasources.{DataSourceStrategy, FileSourceStrategy}
+ import org.apache.spark.sql.execution.datasources.v2.DataSourceV2Strategy
++import org.apache.spark.sql.util.CalibraClient
+ 
+ class SparkPlanner(val session: SparkSession, val experimentalMethods: ExperimentalMethods)
+-  extends SparkStrategies with SQLConfHelper {
++  extends SparkStrategies with SQLConfHelper with Logging {
+ 
+   def numPartitions: Int = conf.numShufflePartitions
+-
++  def greedyEnabled: Boolean = conf.getConfString("spark.sql.planner.greedyEnabled",
++    "false").toBoolean
++  def maxPlans: Int = conf.getConfString("spark.sql.planner.maxPlans", "4").toInt
+   override def strategies: Seq[Strategy] =
+     experimentalMethods.extraStrategies ++
+       extraPlanningStrategies ++ (
+@@ -59,10 +63,35 @@ class SparkPlanner(val session: SparkSession, val experimentalMethods: Experimen
+     }
+   }
+ 
++  def isRuntimePlan(plan: SparkPlan): Boolean = {
++    plan.exists {
++      case _: QueryStageExec => true
++      case _: AQEShuffleReadExec => true
++      case _ => false
++    }
++  }
++
+   override protected def prunePlans(plans: Iterator[SparkPlan]): Iterator[SparkPlan] = {
+-    // TODO: We will need to prune bad plans when we improve plan space exploration
+-    //       to prevent combinatorial explosion.
+-    plans
++    val planList: List[SparkPlan] = plans.toList
++    val planCount = planList.size
++    val isRuntime = planList.exists(isRuntimePlan)
++    if (!greedyEnabled || planCount <= maxPlans || isRuntime) {
++      return planList.iterator
++    }
++    val costs: List[Double] = CalibraClient.chooseBestPlan(
++      1,
++      planList,
++      decisionKind = "listwise",
++      selectK = maxPlans)
++
++    val planWithCost = planList.zip(costs)
++
++    val topPlans = planWithCost.sortBy(_._2).take(maxPlans).map(_._1)
++
++    val prunedCount = planCount - topPlans.size
++    logWarning(s"[Greedy-Prune] pruned $prunedCount / $planCount plans at this level")
++
++    topPlans.iterator
+   }
+ 
+   /**
+diff --git a/sql/core/src/main/scala/org/apache/spark/sql/execution/SparkStrategies.scala b/sql/core/src/main/scala/org/apache/spark/sql/execution/SparkStrategies.scala
+index d851eac..0de7bc6 100644
+--- a/sql/core/src/main/scala/org/apache/spark/sql/execution/SparkStrategies.scala
++++ b/sql/core/src/main/scala/org/apache/spark/sql/execution/SparkStrategies.scala
+@@ -32,6 +32,7 @@ import org.apache.spark.sql.catalyst.plans.logical._
+ import org.apache.spark.sql.catalyst.streaming.{InternalOutputModes, StreamingRelationV2}
+ import org.apache.spark.sql.catalyst.types.DataTypeUtils
+ import org.apache.spark.sql.errors.{QueryCompilationErrors, QueryExecutionErrors}
++import org.apache.spark.sql.execution.adaptive.LogicalQueryStage
+ import org.apache.spark.sql.execution.aggregate.AggUtils
+ import org.apache.spark.sql.execution.columnar.{InMemoryRelation, InMemoryTableScanExec}
+ import org.apache.spark.sql.execution.command._
+@@ -171,7 +172,14 @@ abstract class SparkStrategies extends QueryPlanner[SparkPlan] {
+    */
+   object JoinSelection extends Strategy with JoinSelectionHelper {
+     private val hintErrorHandler = conf.hintErrorHandler
+-
++    val greedyEnabled = conf.getConfString("spark.sql.planner.greedyEnabled",
++      "false").toBoolean
++    val calibraEnabled = conf.getConfString("spark.sql.calibra.enabled",
++      "false").toBoolean
++    val forceBHJMargin = conf.getConfString("spark.sql.planner.forceBHJMargin", "0.2").toDouble
++    val forceBHJMaxSize = conf.getConfString("spark.sql.planner.forceBHJMaxSize", "-1").toLong
++    val forceBHJEnumerateBuildSides = conf.getConfString(
++      "spark.sql.planner.forceBHJEnumerateBuildSides", "true").toBoolean
+     private def checkHintBuildSide(
+         onlyLookingAtHint: Boolean,
+         buildSide: Option[BuildSide],
+@@ -245,6 +253,17 @@ abstract class SparkStrategies extends QueryPlanner[SparkPlan] {
+           }
+         }
+ 
++        def createBroadcastHashJoinForBuildSide(buildSide: BuildSide): Seq[SparkPlan] = {
++          Seq(joins.BroadcastHashJoinExec(
++            leftKeys,
++            rightKeys,
++            joinType,
++            buildSide,
++            nonEquiCond,
++            planLater(left),
++            planLater(right)))
++        }
++
+         def createShuffleHashJoin(onlyLookingAtHint: Boolean) = {
+           val buildSide = getShuffleHashJoinBuildSide(
+             left, right, joinType, hint, onlyLookingAtHint, conf)
+@@ -281,8 +300,45 @@ abstract class SparkStrategies extends QueryPlanner[SparkPlan] {
+           }
+         }
+ 
++        def canForceBHJSide(side: LogicalPlan, conf: SQLConf): Boolean = {
++          val upper = if (forceBHJMaxSize > 0) {
++            forceBHJMaxSize
++          } else {
++            val threshold = conf.autoBroadcastJoinThreshold
++            if (threshold < 0) return false
++
++            (threshold * (1.0 + forceBHJMargin)).toLong
++          }
++
++          val sideSize = side.stats.sizeInBytes
++          sideSize > 0 && sideSize <= upper
++        }
++
++        def forcedBroadcastBuildSides(defaultJoin: Seq[SparkPlan]): Seq[BuildSide] = {
++          if (!forceBHJEnumerateBuildSides || !greedyEnabled || !calibraEnabled ||
++            plan.exists(_.isInstanceOf[LogicalQueryStage])) {
++            return Seq.empty
++          }
++
++          val existingBuildSides = defaultJoin.collect {
++            case bhj: joins.BroadcastHashJoinExec => bhj.buildSide
++          }.toSet
++
++          val candidates = Seq(
++            BuildLeft -> left,
++            BuildRight -> right
++          ).filter {
++            case (BuildLeft, side) =>
++              canBuildBroadcastLeft(joinType) && canForceBHJSide(side, conf)
++            case (BuildRight, side) =>
++              canBuildBroadcastRight(joinType) && canForceBHJSide(side, conf)
++          }.map(_._1)
++
++          candidates.filterNot(existingBuildSides.contains)
++        }
++
+         def createJoinWithoutHint() = {
+-          createBroadcastHashJoin(false)
++          val defaultJoin = createBroadcastHashJoin(false)
+             .orElse(createShuffleHashJoin(false))
+             .orElse(createSortMergeJoin())
+             .orElse(createCartesianProduct())
+@@ -295,8 +351,16 @@ abstract class SparkStrategies extends QueryPlanner[SparkPlan] {
+               Seq(joins.BroadcastNestedLoopJoinExec(
+                 planLater(left), planLater(right), buildSide, joinType, j.condition))
+             }
++          val forcedBuildSides = forcedBroadcastBuildSides(defaultJoin)
++          if (forcedBuildSides.nonEmpty) {
++            val forcedBHJ = forcedBuildSides.flatMap(createBroadcastHashJoinForBuildSide)
++            logWarning(s"Forcing BroadcastHashJoinExec alternatives " +
++              s"${forcedBuildSides.mkString(",")} for join: ${plan.toString}")
++            defaultJoin ++ forcedBHJ
++          } else {
++            defaultJoin
++          }
+         }
+-
+         if (hint.isEmpty) {
+           createJoinWithoutHint()
+         } else {
+diff --git a/sql/core/src/main/scala/org/apache/spark/sql/execution/adaptive/AdaptiveSparkPlanExec.scala b/sql/core/src/main/scala/org/apache/spark/sql/execution/adaptive/AdaptiveSparkPlanExec.scala
+index 77c9696..db41ce4 100644
+--- a/sql/core/src/main/scala/org/apache/spark/sql/execution/adaptive/AdaptiveSparkPlanExec.scala
++++ b/sql/core/src/main/scala/org/apache/spark/sql/execution/adaptive/AdaptiveSparkPlanExec.scala
+@@ -350,16 +350,18 @@ case class AdaptiveSparkPlanExec(
+         val afterReOptimize = reOptimize(logicalPlan)
+         if (afterReOptimize.isDefined) {
+           val (newPhysicalPlan, newLogicalPlan) = afterReOptimize.get
+-          val origCost = costEvaluator.evaluateCost(currentPhysicalPlan)
+-          val newCost = costEvaluator.evaluateCost(newPhysicalPlan)
+-          if (newCost < origCost ||
+-            (newCost == origCost && currentPhysicalPlan != newPhysicalPlan)) {
+-            logOnLevel("Plan changed:\n" +
+-              sideBySide(currentPhysicalPlan.treeString, newPhysicalPlan.treeString).mkString("\n"))
+-            cleanUpTempTags(newPhysicalPlan)
+-            currentPhysicalPlan = newPhysicalPlan
+-            currentLogicalPlan = newLogicalPlan
+-            stagesToReplace = Seq.empty[QueryStageExec]
++          if (currentPhysicalPlan != newPhysicalPlan) {
++            val origCost = costEvaluator.evaluateCost(currentPhysicalPlan)
++            val newCost = costEvaluator.evaluateCost(newPhysicalPlan)
++            if (newCost < origCost || newCost == origCost) {
++              logOnLevel("Plan changed:\n" +
++                sideBySide(currentPhysicalPlan.treeString, newPhysicalPlan.treeString)
++                  .mkString("\n"))
++              cleanUpTempTags(newPhysicalPlan)
++              currentPhysicalPlan = newPhysicalPlan
++              currentLogicalPlan = newLogicalPlan
++              stagesToReplace = Seq.empty[QueryStageExec]
++            }
+           }
+         }
+         // Now that some stages have finished, we can try creating new stages.
