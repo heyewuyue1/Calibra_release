@@ -2,8 +2,6 @@
 
 Calibra combines a Python Spark SQL cost-modeling pipeline with Spark-side Scala integration for Spark 3.5.4. Python training and serving code lives in `src/`, Spark runtime support lives in `RuntimeCost/`, and Spark source changes are maintained as patch material under `spark_patches/`.
 
-This release is a minimal Calibra implementation package. It does not include baseline systems, paper experiment outputs, workflow shell scripts, retained datasets, pretrained checkpoints, or non-default model architectures.
-
 ## Artifact Layout
 
 Run outputs belong under `artifacts/<BENCHMARK>/runs/<RUN_ID>/`. The runtime writes datasets, models, metrics, logs, Spark configuration copies, latency files, and manifests under that run directory.
@@ -15,8 +13,6 @@ The Spark patch in this release is the source of truth:
 ```text
 spark_patches/calibra-spark-3.5.4.patch
 ```
-
-When modifying Calibra's Spark integration, update the patch in this Calibra repository first. Do not make direct edits in a Spark source checkout as the canonical change. If a change is prototyped in a Spark source tree, convert it back into the patch and verify it from a clean Spark 3.5.4 apply.
 
 From a clean Spark 3.5.4 source tree:
 
@@ -43,7 +39,7 @@ Restart Spark services after replacing jars.
 
 Run Calibra phases directly through Python entrypoints. The Spark property files in `conf/` are templates; replace Spark master, local directory, warehouse, event log, and RuntimeCost jar placeholders before use.
 
-No pretrained checkpoint is bundled or used as a default. Bootstrap, training, testing, and online refinement should be run from scratch for a chosen `<RUN_ID>`. The serving entrypoints load the checkpoint produced under `artifacts/<BENCHMARK>/runs/<RUN_ID>/model/` unless `--model-path` is explicitly provided.
+Bootstrap, training, testing, and online refinement can be run from scratch for a chosen `<RUN_ID>`. The serving entrypoints load the checkpoint produced under `artifacts/<BENCHMARK>/runs/<RUN_ID>/model/` unless `--model-path` is explicitly provided.
 
 The bootstrap server uses CBO teacher-plan files by default:
 
